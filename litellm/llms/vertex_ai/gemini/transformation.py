@@ -483,6 +483,7 @@ def _process_gemini_media(
     video_metadata: dict[str, Any] | None = None,
     vertex_project: str | None = None,
     vertex_credentials: object = None,
+    disable_base64_encoding: bool = False,
 ) -> PartType:
     """
     Given a media URL (image, audio, or video), return the appropriate PartType for Gemini
@@ -569,6 +570,20 @@ def _process_gemini_media(
             else:
                 # Gemini Files API references can be passed through as URI-only.
                 file_data = cast(FileDataType, {"file_uri": image_url})
+            part = {"file_data": file_data}
+            return _apply_gemini_metadata(part, model, media_resolution_enum, video_metadata)
+        elif disable_base64_encoding and image_url.startswith(("http://", "https://")):
+            image_type: Final = format or _get_image_mime_type_from_url(image_url)
+            if image_type is None:
+                raise litellm.BadRequestError(
+                    message=(
+                        "disable_base64_encoding requires an explicit image MIME type in "
+                        "image_url.format, image_url.mime_type, or image_url.content_type"
+                    ),
+                    model=model,
+                    llm_provider="vertex_ai",
+                )
+            file_data = FileDataType(mime_type=image_type, file_uri=image_url)
             part = {"file_data": file_data}
             return _apply_gemini_metadata(part, model, media_resolution_enum, video_metadata)
         elif "https://" in image_url and (image_type := format or _get_image_mime_type_from_url(image_url)) is not None:
@@ -710,9 +725,11 @@ def _gemini_convert_messages_with_history(
     tool_call_responses = []
     vertex_project = None
     vertex_credentials = None
+    disable_base64_encoding = False
     if litellm_params:
         vertex_project = litellm_params.get("vertex_project") or litellm_params.get("vertex_ai_project")
         vertex_credentials = litellm_params.get("vertex_credentials") or litellm_params.get("vertex_ai_credentials")
+        disable_base64_encoding = litellm_params.get("disable_base64_encoding") is True
 
     from .vertex_and_google_ai_studio_gemini import VertexGeminiConfig
 
@@ -771,6 +788,7 @@ def _gemini_convert_messages_with_history(
                                 model=model,
                                 vertex_project=vertex_project,
                                 vertex_credentials=vertex_credentials,
+                                disable_base64_encoding=disable_base64_encoding,
                             )
                             _parts.append(_part)
                         elif element["type"] == "input_audio":
@@ -796,6 +814,7 @@ def _gemini_convert_messages_with_history(
                                     model=model,
                                     vertex_project=vertex_project,
                                     vertex_credentials=vertex_credentials,
+                                    disable_base64_encoding=disable_base64_encoding,
                                 )
                                 _parts.append(_part)
                         elif element["type"] == "file":
@@ -1157,6 +1176,12 @@ def _transform_request_body(
     """
     Common transformation logic across sync + async Gemini /generateContent calls.
     """
+    disable_base64_encoding: Final = optional_params.pop("disable_base64_encoding", False) is True
+    litellm_params = {
+        **litellm_params,
+        "disable_base64_encoding": disable_base64_encoding,
+    }
+
     # Separate system prompt from rest of message
     supports_system_message: Final = get_supports_system_message(model=model, custom_llm_provider=custom_llm_provider)
     system_instructions, messages = _transform_system_message(
@@ -1327,6 +1352,14 @@ def _vertex_inlines(media: RemoteMedia) -> bool:
     )
 
 
+def _should_inline_remote_media(media: RemoteMedia, disable_base64_encoding: bool, custom_llm_provider: str) -> bool:
+    if disable_base64_encoding:
+        return False
+    if custom_llm_provider == "gemini":
+        return _ai_studio_inlines(media)
+    return _vertex_inlines(media)
+
+
 async def async_transform_request_body(
     gemini_api_key: str | None,
     messages: list[AllMessageValues],
@@ -1368,8 +1401,12 @@ async def async_transform_request_body(
         vertex_auth_header=vertex_auth_header,
     )
 
+    disable_base64_encoding: Final = optional_params.get("disable_base64_encoding") is True
     inlined_messages: Final = await async_inline_remote_media(
-        messages, should_inline=_ai_studio_inlines if custom_llm_provider == "gemini" else _vertex_inlines
+        messages,
+        should_inline=lambda media: _should_inline_remote_media(
+            media, disable_base64_encoding, custom_llm_provider
+        ),
     )
 
     if _openai_messages_may_need_sync_gcs_metadata_fetch(inlined_messages):
